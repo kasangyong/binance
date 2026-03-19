@@ -1,0 +1,16 @@
+streamlit
+requests
+beautifulsoup4
+feedparser
+newspaper3k
+sumy
+nltk
+lxml_html_clean
+ccxt
+pandas
+numpy
+python-dotenv
+ollama
+ta
+schedule
+plotly
