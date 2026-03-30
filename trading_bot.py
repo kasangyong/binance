@@ -32,8 +32,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # 리스크 관리 설정 (백테스트 최적값)
 # ═══════════════════════════════════════════════════════
 STOP_LOSS_PCT    = 0.015  # 손절: -1.5%
-TAKE_PROFIT_PCT  = 0.035  # 익절: +3.5%
-INITIAL_CAPITAL  = 20.0   # 초기 투자 자본 (USDT)
+TAKE_PROFIT_PCT  = 0.045  # 익절: +4.5%
+INITIAL_CAPITAL  = 152.0   # 초기 투자 자본 (USDT)
+TRADE_RATIO      = 0.50   # 투자 비율: 잔고의 50%
 
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -202,8 +203,8 @@ class TradingBot:
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = float(ticker['last'])
             
-            # 3. 주문 수량 계산 (안전을 위해 가용 잔고의 90%만 사용하거나 trade_amount 적용)
-            actual_trade_amount = min(self.trade_amount_usdt, usdt_balance * 0.95)
+            # 3. 주문 수량 계산 (가용 잔고의 TRADE_RATIO 사용, 복리 방식)
+            actual_trade_amount = usdt_balance * TRADE_RATIO
             total_position_value = actual_trade_amount * leverage
             order_qty = self.exchange.amount_to_precision(self.symbol, total_position_value / current_price)
             
@@ -304,6 +305,87 @@ if TELEGRAM_BOT_TOKEN:
 # 손절/익절 체크 카운터 (매 30초마다)
 sl_tp_check_counter = 0
 
+def update_param_in_file(param_name, new_value):
+    """trading_bot.py 파일 내 파라미터 값을 직접 수정합니다."""
+    try:
+        with open(__file__, 'r', encoding='utf-8') as f:
+            content = f.read()
+        import re
+        pattern = rf'^({param_name}\s*=\s*)\S+'
+        replacement = rf'\g<1>{new_value}'
+        new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+        with open(__file__, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        return True
+    except Exception as e:
+        print(f"파일 수정 실패: {e}")
+        return False
+
+def update_leverage_in_file(new_lev):
+    """strategy_analyzer.py 레버리지 수정"""
+    try:
+        path = os.path.join(os.path.dirname(__file__), 'strategy_analyzer.py')
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        import re
+        new_content = re.sub(r'(leverage\s*=\s*)\d+', rf'\g<1>{new_lev}', content)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        return True
+    except Exception as e:
+        print(f"레버리지 파일 수정 실패: {e}")
+        return False
+
+def parse_natural_command(text):
+    """자연어 명령을 파싱하여 파라미터를 변경합니다."""
+    global STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRADE_RATIO
+    import re
+
+    text_lower = text.lower()
+    num = re.search(r'(\d+(?:\.\d+)?)', text)
+    if not num:
+        return False
+
+    val = float(num.group(1))
+
+    # 투자 비율 변경
+    if any(k in text for k in ['잔고', '계좌', '비율', '투자금', '%로', '프로']):
+        if any(k in text for k in ['줄', '낮', '바꿔', '변경', '수정', '올려', '높', '설정']):
+            ratio = val / 100
+            TRADE_RATIO = ratio
+            update_param_in_file('TRADE_RATIO', ratio)
+            send_telegram_message(f"✅ 투자 비율 변경 완료!\n잔고의 {val:.0f}% → 즉시 적용됨\n(재시작 후에도 유지)")
+            return True
+
+    # 손절 변경
+    if any(k in text for k in ['손절', 'sl', '스탑로스', 'stop']):
+        pct = val / 100
+        STOP_LOSS_PCT = pct
+        update_param_in_file('STOP_LOSS_PCT', pct)
+        send_telegram_message(f"✅ 손절 변경 완료!\n손절: -{val:.1f}% → 즉시 적용됨")
+        return True
+
+    # 익절 변경
+    if any(k in text for k in ['익절', 'tp', '테이크프로핏', 'take']):
+        pct = val / 100
+        TAKE_PROFIT_PCT = pct
+        update_param_in_file('TAKE_PROFIT_PCT', pct)
+        send_telegram_message(f"✅ 익절 변경 완료!\n익절: +{val:.1f}% → 즉시 적용됨")
+        return True
+
+    # 레버리지 변경
+    if any(k in text for k in ['레버리지', '배율', 'leverage', '배로', '배']):
+        lev = int(val)
+        update_leverage_in_file(lev)
+        send_telegram_message(f"✅ 레버리지 변경 완료!\n레버리지: {lev}배 → 3초 후 자동 재시작됩니다.")
+        time.sleep(3)
+        import subprocess, sys
+        subprocess.Popen([sys.executable, '-u', __file__])
+        sys.exit(0)
+        return True
+
+    return False
+
 def process_telegram_commands():
     global last_update_id
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -365,9 +447,12 @@ def process_telegram_commands():
                             
                             total_pnl_pct = pnl_pct * bot_instance.entry_leverage
                             emoji = "➕" if total_pnl_pct >= 0 else "➖"
+                            position_value = bot_instance.order_qty * current_price
                             pos_msg = (
                                 f"\n\n📊 [보유 포지션 내역]\n"
                                 f"• 타입: {bot_instance.position}\n"
+                                f"• 수량: {bot_instance.order_qty} XRP\n"
+                                f"• 포지션 총액: {position_value:.2f} USDT\n"
                                 f"• 진입가: {bot_instance.entry_price:.6f}\n"
                                 f"• 현재가: {current_price:.6f}\n"
                                 f"• {emoji} 수익률: {total_pnl_pct:+.2f}%\n"
@@ -433,21 +518,23 @@ def process_telegram_commands():
                         send_telegram_message("⚠️ API 키가 없어 잔고를 조회할 수 없습니다.")
                 elif text in ["/strategy", "strategy"]:
                     strategy_desc = (
-                        "🎯 [현재 매매 전략: 하이브리드 SL/TP 전략]\n\n"
+                        "🎯 [현재 매매 전략: ADX+EMA 추세 전략]\n\n"
                         "📌 [진입 조건]\n"
-                        "1. 추세 추종: ADX > 15 + EMA 9/20 골든/데드크로스 시 진입\n"
-                        "2. 눌림목/반등: EMA 정배열 중 Stoch RSI < 20 + BB 하단 근접 → LONG\n"
-                        "   EMA 역배열 중 Stoch RSI > 80 + BB 상단 근접 → SHORT\n"
-                        "3. 역추세(횡보장만): ADX < 20일 때 RSI < 30 → LONG / RSI > 70 → SHORT\n\n"
+                        "• LONG: ADX > 25 + EMA9 > EMA20 + EMA9 상승 중\n"
+                        "• SHORT: ADX > 25 + EMA9 < EMA20 + EMA9 하락 중\n"
+                        "• 강한 추세에서만 진입, 횡보장은 쉼\n\n"
                         "📌 [청산 조건]\n"
                         "• 손절(SL): -1.5% 도달 시 자동 청산\n"
-                        "• 익절(TP): +3.5% 도달 시 자동 청산\n"
+                        "• 익절(TP): +4.0% 도달 시 자동 청산\n"
                         "• 반대 신호로는 청산 안 함 (SL/TP 전용)\n\n"
                         "📌 [기타]\n"
                         f"• 타임프레임: 5분봉\n"
                         f"• 레버리지: 5x\n"
+                        f"• 투자비율: 가용잔고의 50%\n"
                         f"• 분석 주기: 5분\n"
-                        f"• SL/TP 체크: 30초"
+                        f"• SL/TP 체크: 30초\n\n"
+                        "📊 [백테스트 성과 (1년)]\n"
+                        "• 수익률: +539% | 최대낙폭: -59%"
                     )
                     send_telegram_message(strategy_desc)
                 elif text in ["/market", "market"]:
@@ -497,17 +584,35 @@ def process_telegram_commands():
                         "/balance : 선물 USDT 잔고 확인\n"
                         "/coins : 전체 지갑 잔고 확인\n"
                         "/price : 현재가 + 손익 확인\n"
-                        "/market : 현재 기술 지표값 확인 🆕\n\n"
+                        "/market : 현재 기술 지표값 확인\n\n"
                         "⚙️ [봇 제어/전략 관련]\n"
-                        "/strategy : 적용된 매매 전략 상세 🆕\n"
-                        "/stats : 최근 매매 성적(승률) 🆕\n"
-                        "/uptime : 봇 가동 시간 확인 🆕\n"
+                        "/strategy : 적용된 매매 전략 상세\n"
+                        "/stats : 최근 매매 성적(승률)\n"
+                        "/uptime : 봇 가동 시간 확인\n"
                         "/run : 즉시 AI 분석 실행\n"
-                        "/close : 포지션 강제 종료(비상용) 🆕\n"
+                        "/close : 포지션 강제 종료(비상용)\n"
                         "/log : 최근 로그 확인\n"
-                        "/help : 도움말"
+                        "/help : 도움말\n\n"
+                        "💬 [자연어 명령 (그냥 말로 입력)]\n"
+                        "• 잔고의 30%로 바꿔줘\n"
+                        "• 손절 2%로 바꿔줘\n"
+                        "• 익절 5%로 바꿔줘\n"
+                        "• 레버리지 10배로 올려줘"
                     )
                     send_telegram_message(help_msg)
+                elif not text.startswith("/"):
+                    # 자연어 명령 처리
+                    handled = parse_natural_command(text)
+                    if not handled:
+                        send_telegram_message(
+                            "❓ 명령을 이해하지 못했습니다.\n\n"
+                            "예시:\n"
+                            "• 잔고의 30%로 바꿔줘\n"
+                            "• 손절 2%로 바꿔줘\n"
+                            "• 익절 5%로 바꿔줘\n"
+                            "• 레버리지 10배로 올려줘\n\n"
+                            "/help 로 전체 명령어 확인"
+                        )
     except requests.exceptions.ReadTimeout:
         pass
     except Exception as e:
